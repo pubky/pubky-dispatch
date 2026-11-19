@@ -221,6 +221,9 @@ impl SwitchClient {
         response: &Response,
     ) -> Result<EnrollmentAnswer, ClientError> {
         let status = response.status;
+        if response.header(header::HEAD).is_some() {
+            return Err(ClientError::BadServiceSignature { status });
+        }
         if !(200..300).contains(&status) {
             // Errors are signed with the service key: a client that pinned it checks them,
             // one that holds none can't (Switch wire 7.1, 7.4.1 Errors).

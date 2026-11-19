@@ -494,6 +494,9 @@ Only `TransportError::Refused` and `TransportError::Connect` allow the client to
 | `Credentials::App` | Supply the app keys, identity and certificate for an app acting on its own account or writing to a peer. |
 | `Credentials::Signer` | The signer authorizes identity-level calls through its signing interface. Keep that authority with the signer. |
 | `Credentials::SignerRequests` | A request-only signer authenticates reads and delivery of previously signed material. Obtain separately signed documents when the operation needs them. |
+| `RecoveryEnrollmentAnswer::Preparation` | The service returned a preparation for the enrollment or its reserved replacement. Save the exact preparation and frozen signed identity document before sending the matching commit. |
+| `RecoveryEnrollmentAnswer::Committed` | The service confirmed the enrollment and its frozen signed identity document. Persist the verified receipt before advancing recovery. |
+| `RecoveryEnrollmentAnswer::Disposition` | The service returned a signed conflict for this commit. An expiry ticket leaves its outcome open. Persist the renewal before sending it. If the service reports a selected replacement, keep that preparation and follow the signer recovery flow. |
 | `Credentials::NextService` | During a cooperative move the destination service uses the signer's transfer and its own key to request export data. This is a service role. |
 | `FeedItem::Entry` | An encrypted inbox entry is available. Run recipient checks before exposing any content. |
 | `FeedItem::Unreadable` | A departed target left an unread entry. Check departure and acceptance time before asking its sender for a new copy. |

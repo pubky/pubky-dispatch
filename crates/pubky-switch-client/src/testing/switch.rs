@@ -1584,6 +1584,21 @@ impl ScriptedSwitch {
         self.lock().chain_identity(doc).map(|_| ())
     }
 
+    /// Deliver the document and retain its exact chain proof and signed head for a
+    /// combined recovery enrollment receipt (Switch account binding 3.3).
+    ///
+    /// # Errors
+    ///
+    /// When the document or its chain proof cannot be written.
+    pub fn deliver_identity_with_proof(
+        &self,
+        doc: &IdentityDoc,
+    ) -> Result<(SignedDoc, SignedHead), ScriptError> {
+        let mut inner = self.lock();
+        let proof = inner.chain_identity(doc)?;
+        Ok((proof, inner.head()))
+    }
+
     /// An entry from `from`'s app `keys` (certificate `cert`): a message of `kind` with
     /// `body`, signed and sealed to the `to` apps' current receive keys. Returns its `seq`
     /// and the message.

@@ -127,6 +127,10 @@ impl Signer {
         // The backup is judged first: an install that took over shows there, and its version
         // must never be superseded by an earlier one the pre-read would take.
         let goes_to = self.recovery_goes_to(origin);
+        if matches!(self.flow, Some(Flow::RecoveryDelivery(_))) && !goes_to {
+            // Replacing an uncertain joint action requires a separate key-holder survey.
+            return Err(Refusal::FlowInProgress.into());
+        }
         if !goes_to {
             self.check_backup_copy().await?;
         }
@@ -238,6 +242,7 @@ impl Signer {
             return false;
         }
         match &self.flow {
+            Some(Flow::RecoveryDelivery(action)) => action.origin == origin,
             Some(Flow::Deliver { .. }) => self
                 .state
                 .service
@@ -455,9 +460,18 @@ impl Signer {
         let observed = observation
             .verify(&self.state.identity, origin)
             .map_err(SignerError::StoredData)?;
-        let answer = self
+        let answer = match self
             .enroll_for_recovery(origin, enrollment, observed.body().service_key)
-            .await?;
+            .await
+        {
+            Ok(answer) => answer,
+            Err(error @ SignerError::Switch(_)) => {
+                return self
+                    .prepare_recovery_delivery(&observed, enrollment, error)
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
         // The enrollment's answer names the key the service signs with from then on: only the
         // one its account discovery showed, which the user confirmed, is followed. Another
         // fails the step, and the recovery is declared again (Switch spec 12.6, 12.8).
@@ -637,7 +651,7 @@ impl Signer {
     /// The key this install pinned for the service at `origin`: the enrolled service's, else
     /// the one an earlier declaration's enrollment there answered, the newest first; `None`
     /// for a service it never enrolled at (Switch wire 7.4.1).
-    fn pinned_for(&self, origin: &str) -> Option<[u8; 32]> {
+    pub(super) fn pinned_for(&self, origin: &str) -> Option<[u8; 32]> {
         self.state
             .service
             .iter()
@@ -732,6 +746,7 @@ impl Signer {
     pub(super) fn recovered_in(state: &mut SignerState, doc: &IdentityDoc) {
         state.recovering = false;
         state.recovery_base = None;
+        state.recovery_commit = None;
         state.lost_generation = None;
         state.homeserver_copy_waived = false;
         state.recovery_origin = None;

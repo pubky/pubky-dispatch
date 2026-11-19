@@ -59,6 +59,7 @@ pub(crate) mod gate;
 mod handover;
 mod key_recovery;
 mod recovery;
+mod recovery_delivery;
 mod renewal;
 mod restore;
 mod revocation;
@@ -196,9 +197,9 @@ pub enum SignerStatus {
         /// The service the recovery goes to.
         origin: String,
     },
-    /// The service at `origin` refused the recovery's version for good: nothing is sent there
-    /// again, and the recovery waits for the user to declare it again, at that service or
-    /// another (Switch spec 12.6 step 1). Nothing else is signed meanwhile.
+    /// The recovery at `origin` needs a new declaration. When the service fenced an
+    /// uncertain recovery enrollment whose renewal evidence is missing, only a separately
+    /// surveyed provider loss at another service can proceed (Switch account binding 3.3).
     RecoveryRefused {
         /// The service that refused it.
         origin: String,
@@ -357,7 +358,7 @@ impl Signer {
         let _budget = self.budget();
         self.refresh().await?;
         loop {
-            self.finish_flow().await?;
+            Box::pin(self.finish_flow()).await?;
             // An erased account: nothing more is owed to it (Switch spec 12.7).
             if self.state.erased {
                 return Ok(());
@@ -479,7 +480,12 @@ impl Signer {
                 } => Box::pin(self.finish_first_setup(&origin, nonce, policy, enrollment)).await?,
                 Flow::FirstAccountPresent { .. } => return Err(Refusal::FirstAccountPresent.into()),
                 Flow::TakingOver { delivery, .. } => self.take_over(delivery).await?,
-                Flow::Recover { origin, enrollment } => self.recover(&origin, &enrollment).await?,
+                Flow::Recover { origin, enrollment } => {
+                    Box::pin(self.recover(&origin, &enrollment)).await?
+                }
+                Flow::RecoveryDelivery(action) => {
+                    Box::pin(self.resume_recovery_delivery(*action)).await?
+                }
                 Flow::KeyRecover {
                     origin,
                     enrollment,
@@ -562,7 +568,12 @@ impl Signer {
                     .or_else(|| self.state.service.as_ref().map(|s| s.origin.clone())),
             }
             .unwrap_or_default();
-            return match self.flow {
+            return match &self.flow {
+                Some(Flow::RecoveryDelivery(action))
+                    if matches!(action.step, state::RecoveryStep::Hold { .. }) =>
+                {
+                    SignerStatus::RecoveryRefused { origin }
+                }
                 Some(_) => SignerStatus::Recovering { origin },
                 None => SignerStatus::RecoveryRefused { origin },
             };
@@ -1918,6 +1929,16 @@ impl Signer {
         // account is the one served from here (Switch spec 12.6 step 1). Whether the end of
         // its staged admission is owed, the next `GET /apps` says, publication's check first.
         if state.recovering {
+            if let Some(pinned) = self.pinned_for(&account.origin)
+                && pinned != account.service_key
+            {
+                state.alert(Alert::ServiceKeyTaken {
+                    origin: account.origin.clone(),
+                    pinned,
+                    service_key: account.service_key,
+                });
+            }
+            state.service = Some(account.clone());
             Self::recovered_in(&mut state, &delivered);
         }
         if let Some(at) = delivered_at {

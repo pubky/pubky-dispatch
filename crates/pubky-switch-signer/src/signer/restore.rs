@@ -269,6 +269,7 @@ impl RestoreLocal {
         // A valid signed version in an otherwise unusable flow still spent that version
         // and may have sent its epoch's keys. It is not proof that a service accepted it.
         let signed = match &flow {
+            Some(Flow::RecoveryDelivery(action)) => Some(&action.doc),
             Some(Flow::Renew { doc, .. } | Flow::Deliver { doc, .. }) => Some(doc),
             Some(Flow::TakingOver { delivery, .. }) => delivery.as_ref().map(|d| &d.doc),
             _ => None,
@@ -335,7 +336,7 @@ pub(super) fn check_local_restore(state: &SignerState, has_flow: bool) -> Result
     if state.erased {
         return Err(Refusal::Erased.into());
     }
-    if has_flow {
+    if has_flow || state.recovery_commit.is_some() {
         return Err(Refusal::FlowInProgress.into());
     }
     if let Some(handing) = &state.handing_over {

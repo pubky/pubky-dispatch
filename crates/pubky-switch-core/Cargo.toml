@@ -9,7 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-# Test-only: fixed sealing randomness, so that the test vectors can be rebuilt byte for byte.
+# Test-only: fixed sealing randomness and service-signed fixtures for the wire vectors.
 # No production build enables it; this crate's own tests turn it on through the
 # dev-dependency below.
 test-vectors = []

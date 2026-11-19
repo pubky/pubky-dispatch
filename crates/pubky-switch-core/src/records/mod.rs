@@ -30,6 +30,7 @@ mod handover;
 mod identity;
 mod key_bundle;
 mod receive_key;
+pub mod recovery_enrollment;
 mod renewal;
 
 pub use account::{

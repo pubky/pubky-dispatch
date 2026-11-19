@@ -172,6 +172,16 @@ impl RequestClient {
     ) -> std::result::Result<EnrollmentAnswer, ClientError> {
         self.0.enroll(enrollment).await
     }
+
+    /// Send the saved recovery packet at the creation selected by the signer.
+    pub(crate) async fn recovery_enrollment(
+        &self,
+        observation: &AccountObservation,
+        packet: &[u8],
+    ) -> std::result::Result<pubky_switch_client::client::RecoveryEnrollmentAnswer, ClientError>
+    {
+        self.0.recovery_enrollment(observation, packet).await
+    }
 }
 
 /// A switch client made from the gated key.

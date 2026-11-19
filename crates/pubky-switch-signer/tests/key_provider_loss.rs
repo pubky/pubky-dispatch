@@ -7,6 +7,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
+#[path = "key_provider_loss/recovery_enrollment.rs"]
+mod recovery_enrollment;
 
 use std::sync::{Arc, Mutex};
 

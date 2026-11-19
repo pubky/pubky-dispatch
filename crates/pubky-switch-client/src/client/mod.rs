@@ -16,8 +16,10 @@ pub mod answers;
 mod batch;
 mod calls;
 pub(crate) mod read;
+mod recovery_enrollment;
 
 pub use batch::{Batch, Submitted};
+pub use recovery_enrollment::RecoveryEnrollmentAnswer;
 
 use std::sync::{Arc, Mutex, PoisonError};
 

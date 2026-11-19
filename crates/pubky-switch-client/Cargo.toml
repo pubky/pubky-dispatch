@@ -23,7 +23,7 @@ tokio = ["dep:tokio", "tokio?/rt", "tokio?/sync"]
 # `testing` module with the scripted switch and its fixtures. No production build enables it;
 # this crate's own tests turn it on through the dev-dependency below, and the tests of other
 # crates through their dev-dependencies.
-test-support = ["dep:blake3", "dep:ed25519-dalek"]
+test-support = ["dep:blake3", "dep:ed25519-dalek", "pubky-switch-core/test-vectors"]
 
 [dependencies]
 bytes = { version = "1", optional = true }

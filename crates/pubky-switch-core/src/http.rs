@@ -739,6 +739,9 @@ pub fn body_cap(method: &str, path: &str) -> Option<usize> {
         ("PUT", ["identity"] | ["peers"]) => 256 << 10,
         ("PUT", ["import", "chunks", _]) => 1 << 20,
         ("POST", ["recovery", "upload"]) => 16 << 20,
+        ("POST", ["recovery", "enrollment"]) => {
+            crate::records::recovery_enrollment::MAX_REQUEST_BYTES
+        }
         ("PUT", ["handover"]) => 12 << 20,
         ("POST", ["freeze"])
         | ("POST", ["unfreeze"])
@@ -754,9 +757,11 @@ pub fn body_cap(method: &str, path: &str) -> Option<usize> {
 
 /// A response-body limit imposed by the call and status, before accumulation or parsing.
 /// `None` leaves the caller's configured limit unchanged; a configured smaller limit still
-/// applies. Only successful account discovery has this additional bound
-/// (Switch account binding 2).
+/// applies (Switch account binding 2, 3.3).
 pub fn response_body_cap(method: &str, path_and_query: &str, status: u16) -> Option<usize> {
+    if method == "POST" && call_of(path_and_query).as_deref() == Some(&["recovery", "enrollment"]) {
+        return Some(crate::records::recovery_enrollment::MAX_RESPONSE_BYTES);
+    }
     (status == 200 && is_account_discovery(method, path_and_query))
         .then_some(crate::records::MAX_ACCOUNT_OBSERVATION_BYTES)
 }

@@ -52,6 +52,8 @@ mod cancellation;
 mod first_enrollment;
 pub use first_enrollment::FirstEnrollmentRestore;
 
+use std::collections::BTreeSet;
+
 use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::AppsAnswer;
 use pubky_switch_client::store::OwnedStoreHandle;
@@ -1153,6 +1155,8 @@ impl Signer {
 /// hold, and the generation a recovery they declared sent a start for.
 pub(super) struct LossFound {
     kept: SignerState,
+    uncertain_origin: Option<String>,
+    required_exclusions: BTreeSet<[u8; 16]>,
     /// A backup a delivery in flight sealed, as the store's flow holds it.
     sealed: Option<Vec<u8>>,
     local: RestoreLocal,
@@ -1170,6 +1174,7 @@ fn loss_found(records: state::ReadRecords, identity: [u8; 32], install: [u8; 16]
     let mut marks = copies_of(&local);
     // A version a flow signed may have reached a service, and spent its version and epoch.
     let signed = match &flow {
+        Some(Flow::RecoveryDelivery(action)) => Some(&action.doc),
         Some(Flow::Renew { doc, .. } | Flow::Deliver { doc, .. }) => Some(doc),
         Some(Flow::TakingOver { delivery, .. }) => delivery.as_ref().map(|d| &d.doc),
         _ => None,
@@ -1183,7 +1188,21 @@ fn loss_found(records: state::ReadRecords, identity: [u8; 32], install: [u8; 16]
         }) => serde_json::to_vec(backup).ok(),
         _ => None,
     };
+    let mut required_exclusions = BTreeSet::new();
+    let mut uncertain_origin = state.as_ref().and_then(|kept| {
+        kept.recovery_commit?;
+        required_exclusions.extend(kept.tombstones.iter().copied());
+        kept.recovery_origin.clone()
+    });
     let enrolled_revoked: Vec<[u8; 16]> = match &flow {
+        Some(Flow::RecoveryDelivery(action)) => {
+            uncertain_origin = Some(action.origin.clone());
+            let revoked = Enrollment::verify(&action.enrollment, &identity, &action.origin)
+                .map(|signed| signed.revoked_apps().to_vec())
+                .unwrap_or_default();
+            required_exclusions.extend(revoked.iter().copied());
+            revoked
+        }
         Some(Flow::Recover {
             origin,
             enrollment: RecoveryEnrollment::Ready { enrollment, .. },
@@ -1229,6 +1248,8 @@ fn loss_found(records: state::ReadRecords, identity: [u8; 32], install: [u8; 16]
         .max(kept.generation_seen);
     LossFound {
         kept,
+        uncertain_origin,
+        required_exclusions,
         sealed,
         local,
         marks,
@@ -1238,18 +1259,25 @@ fn loss_found(records: state::ReadRecords, identity: [u8; 32], install: [u8; 16]
 
 /// Of the App IDs `revoked` (ascending), those a move's enrollment carrying `base` could
 /// carry within seven eighths of its cap, with the headroom every version keeps (Switch wire
-/// 3.7, 7.1), so the identity's later versions still fit. Revoked apps `base` lists or removes always stay. When
+/// 3.7, 7.1). Revoked apps `base` lists or removes and the exclusions of an uncertain
+/// signed recovery enrollment always stay. When
 /// more were found than fit, as when disjoint sources each hold many, the others, revoked
 /// apps no version lists or removes any more, go: the same loss as when no source holds
 /// them, and no recovery is ever refused for their number (Switch spec 12.8).
-fn enrollable(base: Option<&IdentityDoc>, revoked: Vec<[u8; 16]>) -> Result<Vec<[u8; 16]>> {
+fn enrollable(
+    base: Option<&IdentityDoc>,
+    revoked: Vec<[u8; 16]>,
+    required: &BTreeSet<[u8; 16]>,
+) -> Result<Vec<[u8; 16]>> {
     let Some(limit) = enrollment_limit() else {
         return Ok(revoked);
     };
     let named = |app: &[u8; 16]| {
-        base.is_some_and(|base| {
-            base.listed_cert(app).is_some() || base.body().removed.iter().any(|r| &r.app_id == app)
-        })
+        required.contains(app)
+            || base.is_some_and(|base| {
+                base.listed_cert(app).is_some()
+                    || base.body().removed.iter().any(|r| &r.app_id == app)
+            })
     };
     let (kept, rest): (Vec<[u8; 16]>, Vec<[u8; 16]>) = revoked.into_iter().partition(named);
     let policy = base.map_or_else(IdentityPolicy::default, |base| base.body().policy);
@@ -1481,6 +1509,28 @@ impl Signer {
             return Err(stop(KeyRecoveryStop::SurveyChanged));
         };
         let (mut signer, found) = Self::loss_target(env, keyring).await?;
+        if found.uncertain_origin.as_deref() == Some(&to) {
+            let mut signer = Self::open_owned(signer.env, signer.keyring, signer.store).await?;
+            let Some(Flow::RecoveryDelivery(action)) = &signer.flow else {
+                return Err(Refusal::FlowInProgress.into());
+            };
+            let original = action.observation.verify(&signer.state.identity, &to)?;
+            let selected = shown.observation.body();
+            if discovery_of(&original) != discovery_of(&shown.observation)
+                || original.body().store_id != selected.store_id
+                || original.body().erased_at != selected.erased_at
+                || original.body().identity != selected.identity
+                || confirmed
+                    .dropped
+                    .iter()
+                    .any(|app| !signer.state.tombstones.contains(app))
+            {
+                return Err(stop(KeyRecoveryStop::SurveyChanged));
+            }
+            signer.resume().await?;
+            Box::pin(signer.complete_listed_revocations()).await?;
+            return Ok(signer);
+        }
         let plan = Box::pin(signer.loss_plan(&found, &to))
             .await?
             .settle(&shown)?;
@@ -1742,7 +1792,7 @@ impl Signer {
             let mut revoked = found.kept.tombstones.clone();
             revoked.sort_unstable();
             revoked.dedup();
-            let revoked = enrollable(None, revoked)?;
+            let revoked = enrollable(None, revoked, &found.required_exclusions)?;
             let mut survey = KeyRecoverySurvey {
                 origin: to.to_owned(),
                 version: 0,
@@ -1787,7 +1837,7 @@ impl Signer {
             .fates(&base, &docs, backed_up, &found.kept, &answer, kind)
             .await?;
         fates.removed_elsewhere(&answer);
-        fates.revoked = enrollable(Some(&base), fates.revoked)?;
+        fates.revoked = enrollable(Some(&base), fates.revoked, &found.required_exclusions)?;
         let survey = KeyRecoverySurvey::of(
             to.to_owned(),
             &base,

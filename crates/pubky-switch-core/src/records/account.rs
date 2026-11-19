@@ -508,7 +508,7 @@ mod observation_bytes {
     }
 }
 
-mod millis {
+pub(super) mod millis {
     use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
 
     pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
@@ -521,7 +521,7 @@ mod millis {
     }
 }
 
-mod nullable_millis {
+pub(super) mod nullable_millis {
     use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
     pub fn serialize<S: Serializer>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error> {

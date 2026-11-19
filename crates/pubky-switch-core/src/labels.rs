@@ -30,6 +30,10 @@ pub mod sig {
     pub const IDENTITY: &str = "pubky-switch/v1/identity";
     /// Enrollment, signed by the identity key.
     pub const ENROLL: &str = "pubky-switch/v1/enroll";
+    /// Recovery enrollment preparation, signed by the service (Switch account binding 3.3).
+    pub const RECOVERY_PREPARATION: &str = "pubky-switch/v1/recovery-preparation";
+    /// Recovery enrollment expiry ticket, signed by the service (Switch account binding 3.3).
+    pub const RECOVERY_EXPIRY: &str = "pubky-switch/v1/recovery-expiry";
     /// App request, signed by the requesting app's signing key (Switch wire 3.9).
     pub const APP_REQUEST: &str = "pubky-switch/v1/app-request";
     /// Key bundle, signed by the identity key (Switch wire 3.5).

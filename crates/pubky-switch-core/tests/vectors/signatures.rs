@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::common::*;
 
 /// Every signature label of Switch wire 2.3.
-const LABELS: [&str; 23] = [
+const LABELS: [&str; 25] = [
     labels::sig::APP_CERT,
     labels::sig::APP_RECORD,
     labels::sig::RECEIVE_KEY,
@@ -21,6 +21,8 @@ const LABELS: [&str; 23] = [
     labels::sig::DISCARDED,
     labels::sig::EXPORT_MANIFEST,
     labels::sig::ENROLL,
+    labels::sig::RECOVERY_PREPARATION,
+    labels::sig::RECOVERY_EXPIRY,
     labels::sig::MSG,
     labels::sig::HTTP,
     labels::sig::HTTP_RESPONSE,
@@ -181,6 +183,17 @@ fn independent_fields(label: &str, signature: &str) -> Vec<Vec<u8>> {
             .clone()
     };
     match label {
+        labels::sig::RECOVERY_PREPARATION | labels::sig::RECOVERY_EXPIRY => {
+            let member = if label == labels::sig::RECOVERY_PREPARATION {
+                "preparation"
+            } else {
+                "ticket"
+            };
+            let signed: SignedDoc =
+                serde_json::from_value(documents["recovery_enrollment"][member].clone()).unwrap();
+            assert_eq!(signed.sig, signature);
+            vec![alice, signed.body_bytes().unwrap()]
+        }
         labels::sig::APP_CERT
         | labels::sig::APP_RECORD
         | labels::sig::RECEIVE_KEY

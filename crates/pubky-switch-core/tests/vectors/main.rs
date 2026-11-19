@@ -22,6 +22,7 @@ mod identifiers;
 mod keys;
 mod operations;
 mod record_current;
+mod recovery_enrollment;
 mod sealed;
 mod signatures;
 

@@ -26,6 +26,9 @@ use serde::{Deserialize, Serialize};
 use crate::alert::Alert;
 use crate::error::{RecordsFault, Result, SignerError, SignerRecord};
 
+mod recovery_delivery;
+pub(crate) use recovery_delivery::{RecoveryDelivery, RecoveryStep};
+
 /// The version of the records' layout.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -357,6 +360,11 @@ pub(crate) struct SignerState {
     /// included, since that service may have taken it and apps seen it. Kept while the
     /// recovery is declared again elsewhere, and dropped once its version is delivered.
     pub(crate) recovery_base: Option<SignedDoc>,
+    /// The original commit digest while a joint enrollment and delivery is uncertain.
+    /// The recovery base then retains the frozen signed version for a separately confirmed
+    /// provider loss, even if the flow can no longer be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery_commit: Option<[u8; 32]>,
     /// The generation a declared recovery declares lost (Switch spec 12.6 step 1): its
     /// version is the next one, with `recovery_from` this. Kept while the recovery is
     /// declared again, since its base may be a recovery's own version not delivered yet, as
@@ -618,6 +626,7 @@ impl SignerState {
             erased: false,
             recovering: false,
             recovery_base: None,
+            recovery_commit: None,
             lost_generation: None,
             homeserver_copy_waived: false,
             revoke_at_service: false,
@@ -867,6 +876,8 @@ pub(crate) enum Flow {
         /// Preparation or the exact signed enrollment and its original target.
         enrollment: RecoveryEnrollment,
     },
+    /// The exact recovery enrollment and signed document awaiting their joint receipt.
+    RecoveryDelivery(Box<RecoveryDelivery>),
     /// Renewing an app's certificate (Switch spec 3.2, Switch wire 3.8), or completing a data
     /// epoch before a rotation: storing the new certificate and the key bundles at the switch,
     /// batch by batch, then delivering the version.
@@ -975,11 +986,15 @@ impl Flow {
         if let Self::Recover { origin, enrollment } = self {
             enrollment.check_exclusions(state, origin)?;
         }
+        if let Self::RecoveryDelivery(action) = self {
+            action.check_state(state)?;
+        }
         Ok(())
     }
 
     pub(crate) fn check_copies(&self, identity: &[u8; 32]) -> Result<()> {
         match self {
+            Self::RecoveryDelivery(action) => action.check(identity)?,
             Self::Enroll {
                 origin,
                 nonce,
@@ -1180,10 +1195,18 @@ pub(crate) async fn load(
     };
     let flow = records.flow?;
     state.check_stored_copies()?;
-    if let Some(flow) = &flow {
-        flow.check_state(&state)?;
-    }
+    check_flow(&state, flow.as_ref())?;
     Ok(Some((state, flow)))
+}
+
+fn check_flow(state: &SignerState, flow: Option<&Flow>) -> Result<()> {
+    if state.recovery_commit.is_some() && !matches!(flow, Some(Flow::RecoveryDelivery(_))) {
+        return Err(RecordsFault::Incomplete.into());
+    }
+    if let Some(flow) = flow {
+        flow.check_state(state)?;
+    }
+    Ok(())
 }
 
 /// Independently decoded current records, read together while the namespace is owned.
@@ -1227,11 +1250,9 @@ pub(crate) async fn save(
     state.check_copies().map_err(|_| {
         RecordsFault::Invariant("the state to write contains an invalid signed copy")
     })?;
-    if let Some(flow) = flow {
-        flow.check_state(state).map_err(|_| {
-            RecordsFault::Invariant("the flow to write contains an invalid signed copy")
-        })?;
-    }
+    check_flow(state, flow).map_err(|_| {
+        RecordsFault::Invariant("the flow to write disagrees with the signer records")
+    })?;
     let ns = signer_namespace(&state.identity);
     let mut batch = WriteBatch::new();
     batch

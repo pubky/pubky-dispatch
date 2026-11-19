@@ -4,6 +4,8 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
+- A confirmed provider loss can leave an enrollment and its signed recovery document waiting for a joint receipt. Reopen the same signer and call `resume` to retry the saved request. Keep the earlier backup until the receipt is verified when the recovery owes its backup after delivery. The development signer store keeps the original enrollment, signed document and any renewal together. A host using the signer API can continue to use the same methods.
+
 - The signer host can offer `Signer::cancel_key_recovery` when `pending_key_recovery` identifies the original service. Show the holder that a stop may retry that exact enrollment before it can finish. Existing calls to `resume` continue recovery. The development signer flow records whether its existing enrollment was sent and its verified result before signing.
 
 - `Signer::restore_over_unusable` can recover an outstanding document delivery when its locally retained sealed backup also survives at the Homeserver. Show the usual record-loss confirmation. On `Refusal::FlowInProgress` keep the pending operation. After an interrupted replacement, reopen the same store and call `resume`.

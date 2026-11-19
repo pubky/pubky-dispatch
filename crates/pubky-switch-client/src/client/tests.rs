@@ -1,5 +1,7 @@
 //! Unit tests of the client against a scripted switch.
 
+mod recovery_enrollment;
+
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
