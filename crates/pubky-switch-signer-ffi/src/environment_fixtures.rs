@@ -67,7 +67,7 @@ mod hosts {
     };
 
     /// A signer failure a host can inspect (Switch spec 4.3).
-    #[derive(Clone, Copy, uniffi::Enum)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
     pub enum SampleFailure {
         /// The clocks differ (Switch spec 10.1).
         ClockOff,
@@ -97,6 +97,28 @@ mod hosts {
         StoredData,
         /// Signer status holds an alert (Switch spec 4.3).
         Alarm,
+    }
+
+    /// Every sample failure, so a host checks each one (Switch spec 4.3).
+    #[uniffi::export]
+    pub fn sample_failures() -> Vec<SampleFailure> {
+        use SampleFailure::*;
+        vec![
+            ClockOff,
+            HandingOver,
+            KeyRecovery,
+            StoreTooLarge,
+            TransportTooLarge,
+            ErrorAnswer,
+            BodyUnread,
+            UnsignedStatus,
+            Undecodable,
+            NotNamed,
+            HandedOver,
+            InvalidData,
+            StoredData,
+            Alarm,
+        ]
     }
 
     /// Return the selected signer failure through its public mapping (Switch spec 4.3).
@@ -169,7 +191,10 @@ mod hosts {
     ) -> Result<HomeserverTrip, SignerFfiError> {
         runtime::run(async move {
             check_file_size(bytes.len()).map_err(Homeserver)?;
-            let home = session(Arc::from(homeserver));
+            let home = session(
+                Arc::from(homeserver),
+                &pubky_switch_client::transport::HttpConfig::default(),
+            );
             let absent_before = home.get(&path).await.map_err(Homeserver)?.is_none();
             if !absent_before {
                 return Err(SignerFfiError::InvalidInput {

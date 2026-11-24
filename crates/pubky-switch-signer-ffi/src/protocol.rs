@@ -49,7 +49,7 @@ pub fn protocol_names() -> Result<Vec<String>, SignerFfiError> {
 
 /// The authority to display for an approval or renewal (Switch spec 3.2).
 #[derive(uniffi::Record)]
-pub struct ScopeTermsView {
+pub struct ScopeTerms {
     /// Switch permissions in certificate order (Switch wire 3.1).
     pub permissions: Vec<String>,
     /// Requested scopes with Shared Data Keys, in request order (Switch spec 3.5).
@@ -58,9 +58,9 @@ pub struct ScopeTermsView {
 
 /// Apply the Switch and protocol rules to the requested scopes (Switch wire 3.9).
 #[uniffi::export]
-pub fn scope_terms(scopes: Vec<String>) -> Result<ScopeTermsView, SignerFfiError> {
+pub fn scope_terms(scopes: Vec<String>) -> Result<ScopeTerms, SignerFfiError> {
     let terms = read_registry(&REGISTRY)?.terms(&scopes)?;
-    Ok(ScopeTermsView {
+    Ok(ScopeTerms {
         permissions: terms.permission_names(),
         keyed: terms.keyed,
     })
@@ -114,6 +114,26 @@ mod tests {
             })
         ));
         assert_eq!(protocol_names().unwrap(), ["sample"]);
+    }
+
+    #[test]
+    fn test_protocol_refused_scope_names_stay_out_of_the_text() {
+        sample().unwrap();
+        let named = "elsewhere:sentinel-scope-label";
+        let Err(error) = scope_terms(vec![named.into()]) else {
+            panic!("expected a refusal")
+        };
+        let SignerFfiError::Refused {
+            kind: RefusalKind::UnknownScopes,
+            scopes: Some(scopes),
+            ..
+        } = &error
+        else {
+            panic!("expected unknown scopes")
+        };
+        assert_eq!(scopes.names, [named]);
+        assert!(!error.to_string().contains("sentinel-scope-label"));
+        assert!(!format!("{error:?}").contains("sentinel-scope-label"));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use pubky_switch_client::store::{MAX_VALUE_BYTES, StoreHandle};
 use pubky_switch_client::transport::{BoxFuture, HttpConfig, HttpTransport, TransportError};
 use pubky_switch_signer::{Homeserver, Protocols, SignerEnv};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Why the host could not confirm a Homeserver operation (Switch spec 4.1).
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -20,12 +21,12 @@ pub enum HomeserverFailure {
     /// the file is unchanged (Switch wire 3.13).
     #[error("homeserver access denied")]
     Denied,
-    /// The file is larger than [`max_file_bytes`]. A read stops at the bound and returns
+    /// The file is larger than the limit `get` gave. A read stops at the limit and returns
     /// this instead of the bytes (Switch wire 3.13).
     #[error("homeserver file exceeds byte limit")]
     TooLarge {
-        /// The byte bound enforced by the host (Switch wire 3.13).
-        size: u64,
+        /// The limit the file exceeds, in bytes (Switch wire 3.13).
+        limit: u64,
     },
     /// The host could not establish the outcome (Switch spec 4.1).
     #[error("homeserver operation failed")]
@@ -44,38 +45,54 @@ impl From<HomeserverFailure> for TransportError {
             HomeserverFailure::Unreachable => Self::Connect("homeserver connection".into()),
             HomeserverFailure::Timeout => Self::Timeout,
             HomeserverFailure::Denied => Self::Refused("homeserver access".into()),
-            HomeserverFailure::TooLarge { size } => Self::TooLarge(size),
+            HomeserverFailure::TooLarge { limit } => Self::TooLarge(limit),
             HomeserverFailure::Other => Self::Other("homeserver operation".into()),
         }
     }
 }
 
-/// The largest file the signer reads or writes on the Homeserver, in bytes: its 16 MiB local
-/// value limit, which its largest backup fits (Switch wire 3.13).
-#[uniffi::export]
-pub fn max_file_bytes() -> u64 {
-    MAX_VALUE_BYTES
-}
-
-/// Access the identity's files with its authenticated session. Files must fit
-/// [`max_file_bytes`], including the largest backup (Switch wire 3.13). Report every failure
-/// as a [`HomeserverFailure`]: another exception's text is dropped, and an error a Kotlin
-/// callback throws that isn't an `Exception` leaves the call unanswered.
+/// Access the identity's files with its authenticated session. Files are at most 16 MiB, the
+/// signer's local value limit, which its largest backup fits (Switch wire 3.13). Report every
+/// failure as a [`HomeserverFailure`]: another exception's text is dropped, and an error a
+/// Kotlin callback throws that isn't an `Exception` leaves the call unanswered.
+///
+/// Each call has a deadline, the long timeout of the environment's [`TransportOptions`]. A
+/// call past it fails as a timeout, which for `put` and `delete` leaves the outcome unknown.
+/// An answer that comes after the deadline is dropped; the bytes it carries are not freed, a
+/// small leak on that path only.
 #[uniffi::export(callback_interface)]
 #[async_trait::async_trait]
 pub trait HostHomeserver: Send + Sync {
     /// Return None only for a confirmed absence. Throw if absence and denial cannot be
-    /// distinguished, or if the read otherwise fails. Read at most [`max_file_bytes`]: for a
-    /// larger file, throw [`HomeserverFailure::TooLarge`] without returning its bytes, which
+    /// distinguished, or if the read otherwise fails. Read at most `limit` bytes: stop reading
+    /// past it and throw [`HomeserverFailure::TooLarge`] without returning the bytes, which
     /// would be copied in full before the signer could refuse them (Switch wire 3.13).
-    async fn get(&self, path: String) -> Result<Option<Vec<u8>>, HomeserverFailure>;
+    async fn get(&self, path: String, limit: u64) -> Result<Option<Vec<u8>>, HomeserverFailure>;
     /// Confirm an accepted write. The signer may send the same bytes again (Switch wire 3.13).
     async fn put(&self, path: String, bytes: Vec<u8>) -> Result<(), HomeserverFailure>;
     /// Delete the file. Deleting an absent file succeeds (Switch spec 12.7).
     async fn delete(&self, path: String) -> Result<(), HomeserverFailure>;
 }
 
-struct Session(Arc<dyn HostHomeserver>);
+/// The host's session, each call bounded by `deadline`.
+struct Session {
+    host: Arc<dyn HostHomeserver>,
+    deadline: Duration,
+}
+
+impl Session {
+    /// Wait for the host's answer until the deadline: a host that never answers would hold
+    /// the signer's call, and the store's lock with it, without end.
+    async fn answer<T>(
+        &self,
+        call: impl std::future::Future<Output = Result<T, HomeserverFailure>>,
+    ) -> Result<T, TransportError> {
+        match tokio::time::timeout(self.deadline, call).await {
+            Ok(answer) => Ok(answer?),
+            Err(_) => Err(TransportError::Timeout),
+        }
+    }
+}
 
 /// Bound each transfer of a signer file, including the backup (Switch wire 3.13).
 pub(crate) fn check_file_size(len: usize) -> Result<(), TransportError> {
@@ -88,9 +105,10 @@ pub(crate) fn check_file_size(len: usize) -> Result<(), TransportError> {
 
 impl Homeserver for Session {
     fn get(&self, path: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, TransportError>> {
-        let call = self.0.get(path.to_owned());
+        let call = self.host.get(path.to_owned(), MAX_VALUE_BYTES);
         Box::pin(async move {
-            let file = call.await?;
+            // The host stops at the limit; a file over it is refused here all the same.
+            let file = self.answer(call).await?;
             if let Some(bytes) = &file {
                 check_file_size(bytes.len())?;
             }
@@ -102,19 +120,23 @@ impl Homeserver for Session {
         let path = path.to_owned();
         Box::pin(async move {
             check_file_size(bytes.len())?;
-            Ok(self.0.put(path, bytes).await?)
+            self.answer(self.host.put(path, bytes)).await
         })
     }
 
     fn delete(&self, path: &str) -> BoxFuture<'_, Result<(), TransportError>> {
-        let call = self.0.delete(path.to_owned());
-        Box::pin(async move { Ok(call.await?) })
+        let call = self.host.delete(path.to_owned());
+        Box::pin(async move { self.answer(call).await })
     }
 }
 
-/// Adapt the host's authenticated session to signer file operations (Switch spec 4.1).
-pub(crate) fn session(host: Arc<dyn HostHomeserver>) -> Arc<dyn Homeserver> {
-    Arc::new(Session(host))
+/// Adapt the host's authenticated session to signer file operations, each bounded by the
+/// long timeout of `config` (Switch spec 4.1).
+pub(crate) fn session(host: Arc<dyn HostHomeserver>, config: &HttpConfig) -> Arc<dyn Homeserver> {
+    Arc::new(Session {
+        host,
+        deadline: Duration::from_millis(config.long_timeout_ms),
+    })
 }
 
 /// The longest timeout a host may set, in milliseconds: 10 minutes. A slow network raises
@@ -126,14 +148,16 @@ pub const MAX_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 /// service with higher limits needs more, and the bound keeps a read's memory finite.
 pub const MAX_RESPONSE_BYTES: u64 = 256 << 20;
 
-/// HTTP limits, each at least 1 and at most its maximum ([`MAX_TIMEOUT_MS`],
-/// [`MAX_RESPONSE_BYTES`]). Omitted fields keep the client's defaults (Switch wire 7.1).
+/// HTTP limits, each at least 1 and at most its maximum: 600,000 milliseconds (10 minutes) for
+/// a timeout, and 268,435,456 bytes (256 MiB) for the response bound. A value out of range is
+/// refused, naming its field. Omitted fields keep the client's defaults (Switch wire 7.1).
 #[derive(Default, uniffi::Record)]
 pub struct TransportOptions {
     /// Small request timeout in milliseconds (Switch wire 7.1).
     #[uniffi(default = None)]
     pub request_timeout_ms: Option<u64>,
-    /// Bulk transfer timeout in milliseconds (Switch wire 7.1).
+    /// Bulk transfer timeout in milliseconds, also each Homeserver call's deadline (Switch
+    /// wire 7.1).
     #[uniffi(default = None)]
     pub long_timeout_ms: Option<u64>,
     /// Connection timeout in milliseconds (Switch wire 7.1).
@@ -169,12 +193,16 @@ impl TransportOptions {
     }
 }
 
-/// The session and Rust-owned services shared by a signer (Switch spec 4.1).
+/// The session and Rust-owned services shared by a signer (Switch spec 4.1). It holds the
+/// host's Homeserver object until the environment itself is closed, not when a signer is.
 #[derive(uniffi::Object)]
 pub struct SignerEnvironment {
     homeserver: Arc<dyn Homeserver>,
     transport: Arc<HttpTransport>,
     protocols: Protocols,
+    /// The limits the transport and the session were built with, for tests to compare.
+    #[cfg(test)]
+    config: HttpConfig,
 }
 
 #[uniffi::export]
@@ -188,11 +216,13 @@ impl SignerEnvironment {
         let config = transport.config()?;
         let protocols = protocol::registered()?;
         let transport =
-            HttpTransport::new(config).map_err(pubky_switch_client::ClientError::from)?;
+            HttpTransport::new(config.clone()).map_err(pubky_switch_client::ClientError::from)?;
         Ok(Arc::new(Self {
-            homeserver: session(Arc::from(homeserver)),
+            homeserver: session(Arc::from(homeserver), &config),
             transport: Arc::new(transport),
             protocols,
+            #[cfg(test)]
+            config,
         }))
     }
 }
@@ -223,28 +253,59 @@ mod tests {
     #[derive(Default)]
     struct MemoryHome {
         files: Mutex<BTreeMap<String, Vec<u8>>>,
+        /// The limit each read was given.
+        limits: Mutex<Vec<u64>>,
         denied: bool,
         unreachable: bool,
+        failing_writes: bool,
+        never_answers: bool,
     }
 
     #[async_trait::async_trait]
     impl HostHomeserver for MemoryHome {
-        async fn get(&self, path: String) -> Result<Option<Vec<u8>>, HomeserverFailure> {
+        async fn get(
+            &self,
+            path: String,
+            limit: u64,
+        ) -> Result<Option<Vec<u8>>, HomeserverFailure> {
+            self.limits.lock().unwrap().push(limit);
+            if self.never_answers {
+                std::future::pending::<()>().await;
+            }
             if self.denied {
                 return Err(HomeserverFailure::Denied);
             }
             if self.unreachable {
                 return Err(HomeserverFailure::Unreachable);
             }
-            Ok(self.files.lock().unwrap().get(&path).cloned())
+            let file = self.files.lock().unwrap().get(&path).cloned();
+            if file
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() as u64 > limit)
+            {
+                return Err(HomeserverFailure::TooLarge { limit });
+            }
+            Ok(file)
         }
 
         async fn put(&self, path: String, bytes: Vec<u8>) -> Result<(), HomeserverFailure> {
+            if self.never_answers {
+                std::future::pending::<()>().await;
+            }
+            if self.failing_writes {
+                return Err(HomeserverFailure::Other);
+            }
             self.files.lock().unwrap().insert(path, bytes);
             Ok(())
         }
 
         async fn delete(&self, path: String) -> Result<(), HomeserverFailure> {
+            if self.never_answers {
+                std::future::pending::<()>().await;
+            }
+            if self.failing_writes {
+                return Err(HomeserverFailure::Other);
+            }
             self.files.lock().unwrap().remove(&path);
             Ok(())
         }
@@ -253,8 +314,12 @@ mod tests {
     // A host handle the test keeps while the bindings own the box.
     #[async_trait::async_trait]
     impl HostHomeserver for Arc<MemoryHome> {
-        async fn get(&self, path: String) -> Result<Option<Vec<u8>>, HomeserverFailure> {
-            self.as_ref().get(path).await
+        async fn get(
+            &self,
+            path: String,
+            limit: u64,
+        ) -> Result<Option<Vec<u8>>, HomeserverFailure> {
+            self.as_ref().get(path, limit).await
         }
 
         async fn put(&self, path: String, bytes: Vec<u8>) -> Result<(), HomeserverFailure> {
@@ -296,22 +361,79 @@ mod tests {
         env.homeserver.delete(path).await.unwrap();
         env.homeserver.delete(path).await.unwrap();
         assert_eq!(env.homeserver.get(path).await.unwrap(), None);
+        // Every read carried the signer's 16 MiB file limit.
+        let limits = host.limits.lock().unwrap().clone();
+        assert_eq!(limits, [16 << 20; 3]);
+    }
+
+    #[tokio::test]
+    async fn test_environment_failed_writes() {
+        let home = session(
+            Arc::new(MemoryHome {
+                failing_writes: true,
+                ..Default::default()
+            }),
+            &HttpConfig::default(),
+        );
+        assert!(matches!(
+            home.put("/sample", vec![1]).await,
+            Err(TransportError::Other(_))
+        ));
+        assert!(matches!(
+            home.delete("/sample").await,
+            Err(TransportError::Other(_))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_environment_uses_the_hosts_options() {
+        protocol::sample().unwrap();
+        let options = || TransportOptions {
+            request_timeout_ms: Some(12),
+            long_timeout_ms: Some(50),
+            connect_timeout_ms: Some(16),
+            max_response_bytes: Some(18),
+        };
+        let host = MemoryHome {
+            never_answers: true,
+            ..Default::default()
+        };
+        let environment = SignerEnvironment::new(Box::new(host), options()).unwrap();
+        assert_eq!(environment.config, options().config().unwrap());
+        // A host that never answers fails at the long timeout, as a timeout.
+        let env = environment.signer_env(StoreHandle::new(Arc::new(MemoryStore::new())));
+        let started = tokio::time::Instant::now();
+        let calls: [BoxFuture<'_, Result<Option<Vec<u8>>, TransportError>>; 3] = [
+            env.homeserver.get("/sample"),
+            Box::pin(async { env.homeserver.put("/sample", vec![1]).await.map(|()| None) }),
+            Box::pin(async { env.homeserver.delete("/sample").await.map(|()| None) }),
+        ];
+        for call in calls {
+            assert!(matches!(call.await, Err(TransportError::Timeout)));
+        }
+        assert_eq!(started.elapsed(), Duration::from_millis(150));
     }
 
     #[tokio::test]
     async fn test_environment_failed_read() {
-        let denied = session(Arc::new(MemoryHome {
-            denied: true,
-            ..Default::default()
-        }));
+        let denied = session(
+            Arc::new(MemoryHome {
+                denied: true,
+                ..Default::default()
+            }),
+            &HttpConfig::default(),
+        );
         assert!(matches!(
             denied.get("/missing").await,
             Err(TransportError::Refused(_))
         ));
-        let offline = session(Arc::new(MemoryHome {
-            unreachable: true,
-            ..Default::default()
-        }));
+        let offline = session(
+            Arc::new(MemoryHome {
+                unreachable: true,
+                ..Default::default()
+            }),
+            &HttpConfig::default(),
+        );
         assert!(matches!(
             offline.get("/missing").await,
             Err(TransportError::Connect(_))
@@ -331,7 +453,7 @@ mod tests {
             (HomeserverFailure::Denied, TransportFailure::Refused, None),
             (HomeserverFailure::Timeout, TransportFailure::Timeout, None),
             (
-                HomeserverFailure::TooLarge { size: 20 },
+                HomeserverFailure::TooLarge { limit: 20 },
                 TransportFailure::TooLarge,
                 Some(20),
             ),
@@ -354,7 +476,7 @@ mod tests {
         let limit = usize::try_from(MAX_VALUE_BYTES).unwrap();
         assert!(check_file_size(limit).is_ok());
         let host = Arc::new(MemoryHome::default());
-        let home = session(host.clone());
+        let home = session(host.clone(), &HttpConfig::default());
         let path = "/sample";
         assert!(matches!(
             home.put(path, vec![0; limit + 1]).await,
@@ -413,12 +535,30 @@ mod tests {
             .unwrap();
         assert!(trip.absent_before && trip.matched_after_put && trip.absent_after);
         assert!(host.files.lock().unwrap().is_empty());
+        // A file over the limit is refused before the host is called.
+        let over = vec![0; usize::try_from(MAX_VALUE_BYTES).unwrap() + 1];
+        assert!(matches!(
+            homeserver_round_trip(Box::new(host.clone()), "/sample".into(), over).await,
+            Err(SignerFfiError::Homeserver {
+                kind: crate::TransportFailure::TooLarge,
+                size: Some(MAX_VALUE_BYTES),
+                ..
+            })
+        ));
+        assert_eq!(
+            host.limits.lock().unwrap().len(),
+            3,
+            "no call for the refused file"
+        );
         host.put("/sample".into(), vec![4]).await.unwrap();
         assert!(matches!(
             homeserver_round_trip(Box::new(host.clone()), "/sample".into(), vec![]).await,
             Err(SignerFfiError::InvalidInput { .. })
         ));
-        assert_eq!(host.get("/sample".into()).await.unwrap(), Some(vec![4]));
+        assert_eq!(
+            host.get("/sample".into(), MAX_VALUE_BYTES).await.unwrap(),
+            Some(vec![4])
+        );
     }
 
     #[test]
@@ -473,7 +613,21 @@ mod tests {
         }
         .config()
         .unwrap();
-        assert_eq!(config.max_response_bytes, MAX_RESPONSE_BYTES);
+        assert_eq!(
+            (
+                config.request_timeout_ms,
+                config.long_timeout_ms,
+                config.connect_timeout_ms,
+                config.max_response_bytes
+            ),
+            (
+                MAX_TIMEOUT_MS,
+                MAX_TIMEOUT_MS,
+                MAX_TIMEOUT_MS,
+                MAX_RESPONSE_BYTES
+            )
+        );
+        assert_eq!((MAX_TIMEOUT_MS, MAX_RESPONSE_BYTES), (600_000, 256 << 20));
     }
 
     #[test]
