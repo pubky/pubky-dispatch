@@ -1533,3 +1533,84 @@ async fn test_restore_backup_keeps_the_original_account() {
     assert_eq!(world.switch.created(), replacement);
     assert!(world.switch.identity_doc().is_none());
 }
+
+#[tokio::test]
+async fn test_counters_restored_first_delivery_needs_room_for_its_successor() {
+    let world = World::new();
+    let (old, _) = world.enrolled().await;
+    let head = world.published().unwrap();
+    drop(old);
+    let original = world.homeserver.file(SIGNER_BACKUP_PATH).unwrap();
+    let mut body = head.body().clone();
+    body.version = pubky_switch_core::json::MAX_INT;
+    let terminal = IdentityDoc::sign(&world.key, body).unwrap();
+    let records = SignerRecords::new(
+        IdentityKey::from_secret(SECRET),
+        terminal,
+        world.backup().account_created(),
+        &[],
+        &[],
+        Limits::default(),
+        &[],
+        Some(head.hash()),
+    )
+    .unwrap();
+    let backup = SignerBackup::seal(&world.key, &records).unwrap();
+    world
+        .homeserver
+        .set(SIGNER_BACKUP_PATH, serde_json::to_vec(&backup).unwrap());
+    let sends = world.sent_docs().len();
+    let writes = world.homeserver.writes.lock().unwrap().len();
+    assert_eq!(
+        restored(&world).await.unwrap_err(),
+        SignerError::Refused(Refusal::CounterExhausted {
+            counter: pubky_switch_signer::Counter::Version
+        })
+    );
+    assert_eq!(world.sent_docs().len(), sends);
+    assert_eq!(world.homeserver.writes.lock().unwrap().len(), writes);
+    world.assert_published_at(&world.switch, &head);
+    world.homeserver.set(SIGNER_BACKUP_PATH, original);
+    restored(&world).await.unwrap();
+    assert_eq!(
+        world.switch.identity_doc().unwrap().version(),
+        head.version() + 1
+    );
+}
+
+#[tokio::test]
+async fn test_counters_bundle_range_completion() {
+    let world = World::new();
+    let (mut old, store) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut old).await;
+    let head = world.published().unwrap();
+    drop(old);
+    let id = b.keys.app_id_bytes();
+    let part = pubky_switch_core::records::StoredPart {
+        app_id: id,
+        first_epoch: head.data_epoch() + 1,
+        last_epoch: pubky_switch_core::json::MAX_INT,
+        cert: head.listed_cert(&id).unwrap(),
+    };
+    world.homeserver.set(
+        SIGNER_BACKUP_PATH,
+        backup_of(&world, &head, &[], &[&a, &b], &[part]),
+    );
+    world.edit_signer_record(&store, b"state", |s| {
+        s["epoch_through"] = pubky_switch_core::json::MAX_INT.into()
+    });
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    let restored = signer.restore(confirmed()).await.unwrap();
+    assert_eq!(restored.version(), head.version() + 1);
+    let removed = signer.revoke(id, None, confirmed()).await.unwrap();
+    assert_eq!(removed.data_epoch(), head.data_epoch() + 2);
+    world.assert_published_at(&world.switch, &removed);
+    assert!(
+        world
+            .sent_docs()
+            .iter()
+            .all(|doc| doc.data_epoch() <= removed.data_epoch())
+    );
+}

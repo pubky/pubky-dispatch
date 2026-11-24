@@ -383,6 +383,24 @@ impl World {
         (signer, store)
     }
 
+    /// Edit a persisted record while the signer is closed.
+    pub fn edit_signer_record(
+        &self,
+        store: &MemoryStore,
+        name: &[u8],
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let ns = pubky_switch_signer::state::signer_namespace(&self.key.public());
+        let bytes = store.get(&ns, name).unwrap().unwrap();
+        let mut record = serde_json::from_slice(&bytes).unwrap();
+        edit(&mut record);
+        let mut batch = WriteBatch::new();
+        batch
+            .put(&ns, name.to_vec(), serde_json::to_vec(&record).unwrap())
+            .unwrap();
+        store.commit(batch).unwrap();
+    }
+
     /// The real signer transport, optionally bound to an established account.
     pub fn signer_client(&self, created: Option<u64>) -> pubky_switch_client::SwitchClient {
         let client = pubky_switch_client::SwitchClient::new(
@@ -478,6 +496,12 @@ impl World {
         for pair in bodies.windows(2) {
             assert_eq!(pair[0], pair[1], "{method} {suffix} retry body");
         }
+    }
+
+    /// The service and the Homeserver both hold this signed identity document.
+    pub fn assert_published_at(&self, service: &ScriptedSwitch, doc: &IdentityDoc) {
+        assert_eq!(service.identity_doc().unwrap().signed(), doc.signed());
+        assert_eq!(self.published().unwrap().signed(), doc.signed());
     }
 
     /// The number of distinct request bodies, however often each was sent.

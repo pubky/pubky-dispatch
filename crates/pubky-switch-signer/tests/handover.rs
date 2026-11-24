@@ -1985,3 +1985,105 @@ async fn test_hand_over_waits_for_a_pending_revocation() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn test_counters_hand_over_slots_and_take_back() {
+    for abort in [true, false] {
+        let world = World::new();
+        let mut s = setup(&world).await;
+        s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+        drop(s.old);
+        world.edit_signer_record(&s.old_store, b"state", |s| {
+            s["signed_through"] = (pubky_switch_core::json::MAX_INT - 1).into();
+        });
+        let mut old = Signer::open(world.env(s.old_store), world.keyring())
+            .await
+            .unwrap();
+        let version = s.handed.version();
+        if abort {
+            assert_eq!(
+                old.abort_hand_over(confirmed()).await.unwrap(),
+                AbortOutcome::Aborted {
+                    version: version + 2
+                }
+            );
+        } else {
+            *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.into());
+            let _new = Signer::receive_hand_over(
+                world.env(Arc::new(MemoryStore::new())),
+                &s.target,
+                empty_vault(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(world.switch.identity_doc().unwrap().version(), version + 1);
+            *world.homeserver.failing_path.lock().unwrap() = None;
+            assert_eq!(
+                old.take_back(confirmed()).await.unwrap().version(),
+                version + 2
+            );
+        }
+        let next = old.set_record_max_age(Some(60)).await.unwrap();
+        assert_eq!(next.version(), version + 3);
+        world.assert_published_at(&world.switch, &next);
+        assert!(
+            world
+                .sent_docs()
+                .iter()
+                .all(|doc| doc.version() <= next.version())
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_counters_queued_take_over_requires_a_verified_copy() {
+    let world = World::new();
+    let mut s = setup(&world).await;
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    let store = Arc::new(MemoryStore::new());
+    let vault = empty_vault();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    Signer::receive_hand_over(world.env(store.clone()), &s.target, vault.clone())
+        .await
+        .unwrap_err();
+    let queued = world.sent_docs().pop().unwrap();
+    assert_eq!(queued.version(), s.handed.version() + 1);
+    let mut body = queued.body().clone();
+    body.version = pubky_switch_core::json::MAX_INT;
+    let terminal = IdentityDoc::sign(&world.key, body).unwrap();
+    let replace = |doc: &IdentityDoc| {
+        world.edit_signer_record(&store, b"flow", |f| {
+            f["TakingOver"]["delivery"]["doc"] = serde_json::to_value(doc.signed()).unwrap();
+        });
+    };
+    replace(&terminal);
+    let sends = world.sent_docs().len();
+    let writes = world.homeserver.writes.lock().unwrap().len();
+    assert_eq!(
+        Signer::resume_take_over(
+            world.env(store.clone()),
+            world.key.public(),
+            &s.target.keys,
+            vault.clone()
+        )
+        .await
+        .unwrap_err(),
+        SignerError::Refused(Refusal::CounterCopyNeeded {
+            counter: pubky_switch_signer::Counter::Version
+        })
+    );
+    assert_eq!(world.sent_docs().len(), sends);
+    assert_eq!(world.homeserver.writes.lock().unwrap().len(), writes);
+    world.assert_published_at(&world.switch, &s.handed);
+    replace(&queued);
+    let mut signer =
+        Signer::resume_take_over(world.env(store), world.key.public(), &s.target.keys, vault)
+            .await
+            .unwrap();
+    let next = signer.set_record_max_age(Some(60)).await.unwrap();
+    assert_eq!(next.version(), queued.version() + 1);
+    world.assert_published_at(&world.switch, &next);
+}

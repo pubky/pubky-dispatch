@@ -143,6 +143,27 @@ impl std::fmt::Display for SizedBody {
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Refusal {
+    /// A clock-derived floor for recovery without a copy is too high (Switch spec 12.8).
+    /// Correct the device clock and repeat the provider-loss survey.
+    #[error("refused: correct the device clock before choosing the {counter:?} floor")]
+    CounterClock {
+        /// The counter derived from the clock.
+        counter: crate::Counter,
+    },
+    /// A pending counter needs independent evidence. Keep the original bytes and retry
+    /// when a verified copy is reachable (Switch spec 4.3, 12.8).
+    #[error("retry when a verified copy of the {counter:?} counter is available")]
+    CounterCopyNeeded {
+        /// The counter for which a copy is needed.
+        counter: crate::Counter,
+    },
+    /// The counter has no wire-representable successor for this operation
+    /// (Switch wire 1.1). Advancing past that limit requires a protocol change.
+    #[error("refused: advancing the {counter:?} counter requires a wider wire range")]
+    CounterExhausted {
+        /// The counter that would exceed the wire range.
+        counter: crate::Counter,
+    },
     /// The scopes break the Switch's scope rule: at most 32, each a name or `name:<sub>`, each
     /// once, and never a name beside one of its own sub-scopes (Switch spec 3.3, Switch wire
     /// 3.1). The reason is the core's, naming the part of the rule that failed.

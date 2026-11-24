@@ -49,7 +49,6 @@ use pubky_switch_core::http::{ErrorCode, IdentityDelivery};
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::records::{
     AppCert, IDENTITY_PATH, IdentityDoc, SignerRecords, check_handover_copies, revoked_after,
-    take_over_body,
 };
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::Value;
@@ -58,6 +57,7 @@ use zeroize::Zeroizing;
 use super::clients::{AppClient, Target};
 use super::restore::removed_at_switch;
 use super::{Signer, SignerEnv, gate};
+use crate::Counter;
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
 use crate::key::{BackupView, IdentityKeyring, SecretVault};
@@ -303,7 +303,8 @@ impl Signer {
         let switch_removed: Vec<[u8; 16]> = removed_at_switch(&answer, &handed).collect();
         let tombstones = revoked_after(&records, &switch_removed);
         let view = BackupView::of(&records);
-        let mut state = self.taken_records(&view, &answer, self.service()?, tombstones, Vec::new());
+        let mut state =
+            self.taken_records(&view, &answer, self.service()?, tombstones, Vec::new())?;
         state.taking_over = true;
         // The old signer's version, published already: this install's own replaces it.
         state.newest = Some(Newest {
@@ -313,7 +314,10 @@ impl Signer {
             published: true,
             delivered_at: None,
         });
-        let (body, prev) = take_over_body(&records, self.state.install)?;
+        let prev = handed.hash();
+        let mut body = handed.body().clone();
+        body.version = Counter::Version.next(handed.version(), None, 1)?;
+        body.signer = self.state.install;
         drop(records);
         let doc = {
             let key = gate::taking_over_key(&self.keyring, &state, &self.store)?;
@@ -346,6 +350,7 @@ impl Signer {
             return Err(Refusal::NotTakingOver.into());
         };
         let mut delivered_at = None;
+        Box::pin(self.check_queued_counters(&delivery.doc, &self.service()?, 1)).await?;
         if !delivery.won {
             let sent = IdentityDelivery {
                 identity: delivery.doc.clone(),

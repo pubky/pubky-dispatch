@@ -38,6 +38,7 @@ use pubky_switch_core::records::{
 use super::Signer;
 use super::clients::Named;
 use super::renewal::{Op, keyed, push_parts};
+use crate::Counter;
 use crate::alert::Alert;
 use crate::error::{RecordsFault, Refusal, Result, SignerError};
 use crate::state::{Flow, RefusedRequest, RenewBatch, Revoking, SignerState};
@@ -220,8 +221,9 @@ impl Signer {
         }
         // A rotation goes to the epoch after the newest version's, completing first an
         // epoch a given-up rotation sent keys for (Switch spec 3.2, 3.5).
-        if self.state.epoch_through > newest.data_epoch() {
-            self.complete_epoch(&statuses, answered_at).await?;
+        let spent = Counter::Epoch.next(newest.data_epoch(), Some(self.state.epoch_through), 0)?;
+        if spent > newest.data_epoch() {
+            self.rotate_through(&statuses, answered_at, spent).await?;
             newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
             (statuses, answered_at) = self.switch_apps_at().await?;
         }
@@ -263,7 +265,9 @@ impl Signer {
                 "Switch wire 7.4.12: the switch took the revocation but gave no time for it".into(),
             )));
         }
-        let completing = !found.apps.is_empty() && self.state.epoch_through > newest.data_epoch();
+        let completing = !found.apps.is_empty()
+            && Counter::Epoch.floor(newest.data_epoch(), Some(self.state.epoch_through))
+                > newest.data_epoch();
         self.removal_version(&newest, &statuses, answered_at, found)
             .await?;
         if completing {
@@ -273,7 +277,7 @@ impl Signer {
                 .newest_doc()?
                 .ok_or(Refusal::NotSetUp)?
                 .data_epoch();
-            self.rotate_through(&statuses, answered_at, next.saturating_add(1))
+            self.rotate_through(&statuses, answered_at, Counter::Epoch.next(next, None, 1)?)
                 .await?;
         }
         Ok(())
@@ -294,13 +298,9 @@ impl Signer {
         let last = if removing.is_empty() {
             newest.data_epoch()
         } else {
-            newest
-                .data_epoch()
-                .checked_add(1)
-                .ok_or(SignerError::Records(RecordsFault::Invariant(
-                    "the data epoch can't go higher",
-                )))?
+            Counter::Epoch.next(newest.data_epoch(), None, 1)?
         };
+        self.state.next_version(newest.version())?;
         let held: Vec<[u8; 32]> = self.held_certs()?.iter().map(|cert| cert.hash()).collect();
         let key = self.signing_key()?;
         // The apps removed get no part, whatever the switch shows of them.
@@ -319,7 +319,9 @@ impl Signer {
         })?;
         drop(key);
         let mut state = self.state.clone();
-        state.epoch_through = state.epoch_through.max(last);
+        state.epoch_through = Counter::Epoch
+            .floor(newest.data_epoch(), Some(state.epoch_through))
+            .max(last);
         state.alerts.retain(|a| {
             !matches!(a, Alert::RevocationUnconfirmed { app_id }
                 | Alert::RevocationPending { app_id, .. } if cut.contains(app_id))
@@ -738,7 +740,7 @@ impl Signer {
         let (statuses, now) = (read.answer.apps, read.answer.server_time);
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let certs = self.held_certs()?;
-        let current = newest.data_epoch();
+        let current = Counter::Epoch.next(newest.data_epoch(), None, 0)?;
         let protocols = self.env.protocols.clone();
         let keyed = keyed(&protocols);
         let key = self.signing_key()?;

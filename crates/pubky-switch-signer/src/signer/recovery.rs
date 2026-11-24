@@ -46,6 +46,7 @@ use super::clients::{RequestClient, Target};
 use super::erasure::withdraw_reminders;
 use super::revocation::UserConfirmed;
 use super::{Room, Signer, gate};
+use crate::Counter;
 use crate::alert::{Alert, Source};
 use crate::error::{RecordsFault, Refusal, Result, SignerError};
 use crate::state::{self, DeliverStep, Flow, RecoveryEnrollment, Service, SignerState};
@@ -141,6 +142,11 @@ impl Signer {
                 )));
         }
         // Taken before the checks below, which may end a flow in progress.
+        if let Some(Flow::Deliver { doc, account, .. } | Flow::Renew { doc, account, .. }) =
+            &self.flow
+        {
+            Box::pin(self.check_queued_counters(doc, account, 1)).await?;
+        }
         let base = self.recovery_base()?.ok_or(Refusal::NotSetUp)?;
         // The copies the lost service can't be asked about: the backup and the Homeserver's
         // `identity.json` show another install that took over, or records behind (Switch
@@ -187,8 +193,10 @@ impl Signer {
             withdraw_reminders(&mut state, &reminded)?;
         }
         state.erased = false;
+        if !state.recovering || state.recovery_base.is_none() {
+            state.recovery_base = Some(base.signed().clone());
+        }
         state.recovering = true;
-        state.recovery_base = Some(base.signed().clone());
         state.lost_generation = Some(lost);
         state.homeserver_copy_waived = waived;
         state.recovery_origin = Some(origin.to_owned());
@@ -353,9 +361,9 @@ impl Signer {
     pub(super) fn recovery_base(&self) -> Result<Option<IdentityDoc>> {
         let identity = self.state.identity;
         if self.state.recovering
-            && let Some(base) = &self.state.recovery_base
+            && let Some(base) = self.state.recovery_doc(self.state.newest_doc()?)?
         {
-            return state::stored_identity(base, &identity).map(Some);
+            return Ok(Some(base));
         }
         let Some(newest) = self.state.newest_doc()? else {
             return Ok(None);
@@ -378,11 +386,24 @@ impl Signer {
     /// The generation the recovery declares lost: the one kept for a recovery declared
     /// already, else `base`'s.
     fn lost_generation(&self, base: Option<&IdentityDoc>) -> Result<u64> {
-        self.state
-            .lost_generation
-            .filter(|_| self.state.recovering)
-            .or_else(|| base.map(IdentityDoc::generation))
-            .ok_or_else(|| RecordsFault::Invariant("a recovery declares no generation lost").into())
+        let pending = self.state.lost_generation.filter(|_| self.state.recovering);
+        if let Some(base) = base {
+            // A restored first document of this recovery already names its lost generation.
+            if let Some(lost) = pending.filter(|lost| Some(*lost) == base.body().recovery_from) {
+                return Ok(lost);
+            }
+            return Ok(Counter::Generation.floor(base.generation(), pending));
+        }
+        Counter::Generation.clock_floor(pending)
+    }
+
+    fn recovery_generation(base: Option<&IdentityDoc>, lost: u64) -> Result<u64> {
+        let verified = match base {
+            Some(doc) if doc.body().recovery_from == Some(lost) => lost,
+            Some(doc) => doc.generation(),
+            None => Counter::Generation.clock_floor(Some(lost))?,
+        };
+        Counter::Generation.next(verified, Some(lost), 1)
     }
 
     /// The body of the recovery's version on `base`, declaring generation `lost` lost and
@@ -399,11 +420,7 @@ impl Signer {
         service_key: [u8; 32],
         until: u64,
     ) -> Result<IdentityBody> {
-        let generation =
-            lost.checked_add(1)
-                .ok_or(SignerError::Records(RecordsFault::Invariant(
-                    "the generation can't go higher",
-                )))?;
+        let generation = Self::recovery_generation(base, lost)?;
         let Some(base) = base else {
             let mut body = IdentityBody::first(
                 self.state.identity,
@@ -411,14 +428,10 @@ impl Signer {
                 Inbox::new(origin, service_key),
                 IdentityPolicy::default(),
             );
-            body.version = self
-                .state
-                .signed_through
-                .checked_add(1)
-                .ok_or(SignerError::Records(RecordsFault::Invariant(
-                    "the version can't go higher",
-                )))?;
+            let floor = Counter::Version.clock_floor(Some(self.state.signed_through))?;
+            body.version = Counter::Version.next(floor, None, 1)?;
             body.generation = generation;
+            body.data_epoch = Counter::Epoch.next(0, None, 1)?;
             body.recovery_from = Some(lost);
             return Self::measured(&self.state, body, None, Room::Cap);
         };
@@ -445,6 +458,14 @@ impl Signer {
         origin: &str,
         enrollment: &RecoveryEnrollment,
     ) -> Result<()> {
+        let base = self.recovery_base()?;
+        let lost = self.lost_generation(base.as_ref())?;
+        if let Some(base) = &base {
+            self.state.next_version(base.version())?;
+        } else {
+            Counter::Version.clock_floor(Some(self.state.signed_through))?;
+        }
+        Self::recovery_generation(base.as_ref(), lost)?;
         let RecoveryEnrollment::Ready {
             observation,
             enrollment,
@@ -466,8 +487,6 @@ impl Signer {
                 "Switch wire 7.4.1: the enrollment's answer names another key than the account discovery".into(),
             )));
         }
-        let base = self.recovery_base()?;
-        let lost = self.lost_generation(base.as_ref())?;
         let until = self.env.clock.now_ms().saturating_add(CLOCK_TOLERANCE_MS);
         // The enrollment names no App ID this version lists: both come from `base`.
         let body = self.recovery_body(base.as_ref(), lost, origin, answer.service_key, until)?;
@@ -534,7 +553,8 @@ impl Signer {
             }
         };
         state.service = Some(service.clone());
-        state.signed_through = state.signed_through.max(doc.version());
+        state.lost_generation = Some(lost);
+        state.signed_through = doc.version();
         // After a recovery with the key alone the version may name a certificate this install
         // doesn't hold, and no backup of it can be sealed: it is written once the delivery
         // has won, as a racing delivery's is, by the version that drops those certificates

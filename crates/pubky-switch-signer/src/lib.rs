@@ -29,6 +29,7 @@
 //! - [`error`]: the typed errors.
 
 pub mod alert;
+mod counters;
 pub mod error;
 pub mod homeserver;
 pub mod key;
@@ -38,6 +39,7 @@ mod signer;
 pub mod state;
 
 pub use alert::{Alert, FirstEnrollmentStop, RenewalSkip, Source};
+pub use counters::Counter;
 pub use error::{
     KeyRecoveryStop, RecordsFault, Refusal, Result, SignerError, SignerRecord, SizedBody,
 };

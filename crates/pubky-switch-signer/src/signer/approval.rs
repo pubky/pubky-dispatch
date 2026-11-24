@@ -442,6 +442,8 @@ impl Signer {
         let protocols = self.env.protocols.clone();
         let has_keys = |scope: &str| protocols.has_keys(scope);
         let key = self.signing_key()?;
+        let head = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
+        self.state.next_version(head.version())?;
         let cert = AppCert::issue(
             &key,
             AppCertBody::new(

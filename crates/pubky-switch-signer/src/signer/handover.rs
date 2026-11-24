@@ -50,10 +50,11 @@
 
 use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::StoredHandover;
-use pubky_switch_core::records::{AppCert, IdentityDoc, SIGNER_BACKUP_PATH, abort_body, succeeded};
+use pubky_switch_core::records::{AppCert, IdentityDoc, SIGNER_BACKUP_PATH, succeeded};
 
 use super::revocation::UserConfirmed;
 use super::{Signer, gate};
+use crate::Counter;
 use crate::alert::Alert;
 use crate::error::{RecordsFault, Refusal, Result, SignerError};
 use crate::state::{DeliverStep, Flow, HandOverSent, HandingOver, TakeBack};
@@ -102,6 +103,8 @@ impl Signer {
         // owes its record's deletion is in the sealed records as a tombstone, and the new
         // signer owes that deletion again from them.
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
+        // Both the take-over and the old install's abort need a slot (Switch wire 3.12).
+        Counter::Version.next(newest.version(), None, 2)?;
         if self
             .state
             .revoking
@@ -200,20 +203,26 @@ impl Signer {
         // the version handed over: once the new signer has moved on, an abort at that version
         // plus 2 would be another body at a version the new signer signed.
         if self.flow.is_none() {
-            match self.switch_at_mark().await {
+            let read = match self.switch_at_mark().await {
                 Err(SignerError::HandedOver { install }) => {
                     return Ok(AbortOutcome::SucceededBy { install });
                 }
-                other => drop(other?),
+                other => other?,
+            };
+            if read.answer.identity.as_ref() != Some(&handing.doc) {
+                return Err(Refusal::StaleHandOver.into());
             }
             let handed = crate::state::stored_identity(&handing.doc, &self.state.identity)?;
-            let (body, prev) = abort_body(&handed)?;
+            let prev = handed.hash();
+            let mut body = handed.body().clone();
+            body.version = Counter::Version.next(handed.version(), None, 2)?;
             let doc = {
                 let key = gate::hand_over_key(&self.keyring, &self.state, &self.store)?;
                 IdentityDoc::sign(&key, body)?
             };
             let mut state = self.state.clone();
-            state.signed_through = state.signed_through.max(doc.version());
+            state.signed_through =
+                Counter::Version.floor(doc.version(), Some(state.signed_through));
             // It races the new signer, so its backup is written once it has won (Switch wire
             // 3.13 "When it is written").
             state.backup_owed = true;
@@ -442,13 +451,7 @@ impl Signer {
                 Some(take_back) => take_back,
                 None => {
                     let mut body = copy.body().clone();
-                    body.version = copy
-                        .version()
-                        .max(self.state.signed_through)
-                        .checked_add(1)
-                        .ok_or(SignerError::Records(RecordsFault::Invariant(
-                            "the version can't go higher",
-                        )))?;
+                    body.version = self.state.next_version(copy.version())?;
                     body.signer = self.state.install;
                     let doc = {
                         let key = gate::hand_over_key(&self.keyring, &self.state, &self.store)?;
@@ -464,7 +467,7 @@ impl Signer {
             let version =
                 crate::state::stored_identity(&take_back.doc, &self.state.identity)?.version();
             let mut state = self.state.clone();
-            state.signed_through = state.signed_through.max(version);
+            state.signed_through = Counter::Version.floor(version, Some(state.signed_through));
             // It races the new signer, so its backup is written once it has won (Switch wire
             // 3.13 "When it is written").
             state.backup_owed = true;

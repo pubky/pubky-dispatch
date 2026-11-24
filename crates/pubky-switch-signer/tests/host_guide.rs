@@ -17,6 +17,7 @@ const GUIDE: &str = include_str!("../../../docs/signer-host-guide.md");
 const SOURCES: &[(&str, &str)] = &[
     ("lib.rs", include_str!("../src/lib.rs")),
     ("alert.rs", include_str!("../src/alert.rs")),
+    ("counters.rs", include_str!("../src/counters.rs")),
     ("error.rs", include_str!("../src/error.rs")),
     ("homeserver.rs", include_str!("../src/homeserver.rs")),
     ("key.rs", include_str!("../src/key.rs")),
@@ -85,6 +86,7 @@ const COVERED: &[&str] = &[
     "RecordsFault",
     "SignerRecord",
     "Refusal",
+    "Counter",
     "SizedBody",
     "KeyError",
     "AddOutcome",

@@ -47,6 +47,7 @@ use super::SignerEnv;
 use super::clients::{RequestClient, Target};
 use super::key_recovery::{Found, KeyRecoveryConfirmed, RestoreConfirmed};
 use super::{Signer, gate};
+use crate::Counter;
 use crate::alert::Alert;
 use crate::error::{KeyRecoveryStop, RecordsFault, Refusal, Result, SignerError};
 use crate::key::{BackupView, IdentityKeyring};
@@ -173,6 +174,8 @@ pub(super) struct RestoreLocal {
     pub(super) copies: [KeptCopy; 2],
     /// A verified first discovery can locate a service when no signed copy names one.
     pub(super) first_account_origin: Option<String>,
+    /// The verified version spent by an undelivered flow (Switch spec 4.3).
+    pub(super) spent_doc: Option<Box<IdentityDoc>>,
     pub(super) signed_through: Option<u64>,
     pub(super) epoch_through: Option<u64>,
 }
@@ -187,6 +190,11 @@ impl RestoreLocal {
             None => [KeptCopy::Unusable, KeptCopy::Unusable],
         };
         let mut local = Self {
+            spent_doc: state
+                .as_ref()
+                .and_then(|s| s.spent_doc.as_ref())
+                .and_then(|doc| state::stored_identity(doc, identity).ok())
+                .map(Box::new),
             signed_through: state.as_ref().map(|state| state.signed_through),
             epoch_through: state.as_ref().map(|state| state.epoch_through),
             state,
@@ -295,16 +303,19 @@ impl RestoreLocal {
             .map(str::to_owned);
         // A valid signed version in an otherwise unusable flow still spent that version
         // and may have sent its epoch's keys. It is not proof that a service accepted it.
-        let signed = match &flow {
-            Some(Flow::Renew { doc, .. } | Flow::Deliver { doc, .. }) => Some(doc),
-            Some(Flow::TakingOver { delivery, .. }) => delivery.as_ref().map(|d| &d.doc),
-            _ => None,
-        };
-        if let Some(signed) = signed
+        if let Some(signed) = flow.as_ref().and_then(Flow::signed_version)
             && let Ok(doc) = state::stored_identity(signed, identity)
         {
-            local.signed_through = Some(local.signed_through.unwrap_or(0).max(doc.version()));
-            local.epoch_through = Some(local.epoch_through.unwrap_or(0).max(doc.data_epoch()));
+            local.epoch_through = Some(Counter::Epoch.floor(doc.data_epoch(), local.epoch_through));
+            local.signed_through =
+                Some(Counter::Version.floor(doc.version(), local.signed_through));
+            if local
+                .spent_doc
+                .as_ref()
+                .is_none_or(|held| held.version() < doc.version())
+            {
+                local.spent_doc = Some(Box::new(doc));
+            }
         }
         if pending
             && local.state.as_ref().is_none_or(|state| {
@@ -707,6 +718,7 @@ impl Signer {
         let view = self.open_backup(&bytes)?.ok_or(Refusal::UnreadableBackup)?;
         let account = view.service();
         let doc = &view.identity_doc;
+        Counter::Version.repair(doc.version(), &mut state.signed_through);
         if doc.signed() != &newest.doc
             || doc.body().signer != state.install
             || doc.version() != state.signed_through
@@ -777,7 +789,6 @@ impl Signer {
         }) {
             return Err(Refusal::FlowInProgress.into());
         }
-        let local = RestoreLocal::from_state(Some(state.clone()), &state.identity);
         let newest = state.newest.as_ref().ok_or(Refusal::FlowInProgress)?;
         let bytes = self
             .env
@@ -788,6 +799,10 @@ impl Signer {
             .ok_or(Refusal::FlowInProgress)?;
         let view = self.open_backup(&bytes)?.ok_or(Refusal::FlowInProgress)?;
         let predecessor = &view.identity_doc;
+        crate::counters::check_copy(&successor, Some(predecessor), 1)?;
+        Counter::Version.repair(successor.version(), &mut state.signed_through);
+        Counter::Epoch.repair(successor.data_epoch(), &mut state.epoch_through);
+        let local = RestoreLocal::from_state(Some(state.clone()), &state.identity);
         if let Some((target, replacement)) = certificate {
             let original = predecessor
                 .listed_cert(&target)
@@ -1044,6 +1059,11 @@ impl Signer {
             published: false,
             delivered_at: None,
         });
+        state.next_version(doc.version())?;
+        // The opened backup independently authenticates this exact delivery (Switch wire 3.13).
+        if first.is_some() {
+            crate::counters::check_copy(&doc, Some(&view.identity_doc), 1)?;
+        }
         // The version the backup holds goes first when the switch is at the one before.
         let deliver_first = first.map(|prev| Flow::Deliver {
             account: service,
@@ -1061,6 +1081,9 @@ impl Signer {
             Ok(()) => {}
             // The recovery's version wasn't taken: the restore is done, the recovery in
             // progress, resumed or declared again at another service from here.
+            Err(error @ SignerError::Refused(Refusal::CounterCopyNeeded { .. })) => {
+                return Err(error);
+            }
             Err(_) if recovering => return Ok(doc),
             Err(error) => return Err(error),
         }
@@ -1139,16 +1162,20 @@ impl Signer {
         } else {
             Vec::new()
         };
-        let mut state = self.taken_records(view, answer, service, tombstones, cleanup);
+        let mut state = self.taken_records(view, answer, service, tombstones, cleanup)?;
         if let Some(local) = local {
+            state.spent_doc = local.spent_doc.as_ref().map(|doc| doc.signed().clone());
             if let Some(epoch) = local.epoch_through {
+                let epoch = Counter::Epoch.floor(doc.data_epoch(), Some(epoch));
                 if epochs_bound && epoch > doc.data_epoch().saturating_add(1) {
                     return Err(Refusal::StaleBackup.into());
                 }
                 state.epoch_through = state.epoch_through.max(epoch);
             }
             if let Some(version) = local.signed_through {
-                state.signed_through = state.signed_through.max(version);
+                state.signed_through = state.signed_through.max(
+                    Counter::Version.floor(state.verified_version(doc.version())?, Some(version)),
+                );
             }
         }
         if let Some(kept) = kept {
@@ -1243,10 +1270,11 @@ impl Signer {
         service: Service,
         mut tombstones: Vec<[u8; 16]>,
         cleanup: Vec<[u8; 16]>,
-    ) -> SignerState {
+    ) -> Result<SignerState> {
         let doc = &view.identity_doc;
         let mut state = SignerState::new(self.state.identity, self.state.install);
-        state.signed_through = self.state.signed_through.max(doc.version());
+        state.signed_through =
+            Counter::Version.floor(doc.version(), Some(self.state.signed_through));
         state.alerts = restored_alerts(&self.state);
         state.service = Some(service);
         state.certs = view.certs.iter().map(|c| c.signed().clone()).collect();
@@ -1268,7 +1296,9 @@ impl Signer {
                     .flat_map(|s| s.bundle_ranges.iter().map(|r| r.last)),
             )
             .fold(doc.data_epoch(), u64::max);
-        let most = doc.data_epoch().saturating_add(1);
+        let epoch = doc.data_epoch();
+        let step = u64::from(claimed > epoch && epoch < pubky_switch_core::json::MAX_INT);
+        let most = Counter::Epoch.next(epoch, None, step)?;
         if claimed > most {
             state.alert(Alert::EpochFloorBounded {
                 claimed,
@@ -1276,6 +1306,8 @@ impl Signer {
             });
         }
         state.epoch_through = claimed.min(most);
+        // A damaged range cannot establish which keys its ciphertext actually carries.
+        state.bundle_parts.retain(|part| part.last_epoch <= most);
         state.deletion_checks = tombstones
             .iter()
             .copied()
@@ -1311,7 +1343,7 @@ impl Signer {
             }
         }
         state.tombstones = tombstones;
-        state
+        Ok(state)
     }
 
     /// The key the service a backup's recovery went to served the lost generation with,
@@ -1389,7 +1421,7 @@ impl Signer {
                     return Err(SignerError::Alarm(alarm.clone()));
                 }
                 if let Some(seen) = state.records_behind
-                    && doc.version() < seen
+                    && doc.version() < Counter::Version.floor(doc.version(), Some(seen))
                 {
                     return Err(Refusal::StaleBackup.into());
                 }

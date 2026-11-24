@@ -43,12 +43,13 @@ use pubky_switch_core::ops::{KeyBundlePut, OpKind};
 use pubky_switch_core::records::{
     AppCert, AppCertBody, AppRequest, Approval, ApprovalClaim, AuthRequest, BundlePart,
     CLOCK_TOLERANCE_MS, IdentityDoc, ListedApp, MAX_CERT_LIFETIME_MS, RenewedCert, StoredPart,
-    incremental_first_epoch, is_reduction, owed_closings, reduction_rotates, seal_bundle_parts,
+    incremental_first_epoch, is_reduction, owed_closings, seal_bundle_parts,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
 use super::Signer;
+use crate::Counter;
 use crate::alert::{Alert, RenewalSkip};
 use crate::error::{RecordsFault, Refusal, Result, SignerError};
 use crate::key::SigningKey;
@@ -168,6 +169,18 @@ impl Signer {
             return Err(Refusal::NotJoined.into());
         }
 
+        let protocols = self.env.protocols.clone();
+        let keyed = keyed(&protocols);
+        let rotates = old
+            .scopes()
+            .iter()
+            .any(|s| keyed(s) && !pubky_switch_core::scopes::holds(&scopes, s));
+        let highest_spent_epoch =
+            Counter::Epoch.next(newest.data_epoch(), Some(self.state.epoch_through), 0)?;
+        self.state.next_version(newest.version())?;
+        if rotates {
+            Counter::Epoch.next(highest_spent_epoch, None, 1)?;
+        }
         let key = self.signing_key()?;
         let new = AppCert::issue(
             &key,
@@ -182,17 +195,17 @@ impl Signer {
             ),
         )?;
         drop(key);
-        let protocols = self.env.protocols.clone();
-        let keyed = keyed(&protocols);
-        let rotates = reduction_rotates(&old, &new, &keyed);
         // A rotation goes to the epoch after the newest version's. When a rotation that was
         // given up sent keys above that one, the epoch it sent is completed first, so no app
         // holds the new epoch's keys early and no epoch is skipped (Switch spec 3.2, 3.5).
         let (newest, statuses, switch_time) =
-            if rotates && self.state.epoch_through > newest.data_epoch() {
+            if rotates && highest_spent_epoch > newest.data_epoch() {
                 // The renewal is signed only once the completion is delivered: cut off there,
                 // no later call makes it, so the user is told now (Switch spec 3.2).
-                if let Err(error) = self.complete_epoch(&statuses, switch_time).await {
+                if let Err(error) = self
+                    .rotate_through(&statuses, switch_time, highest_spent_epoch)
+                    .await
+                {
                     if matches!(by, RenewedBy::User) {
                         let mut state = self.state.clone();
                         let asked = AskedRenewal::between(app_id, &old, &new);
@@ -215,11 +228,7 @@ impl Signer {
             };
         let current = newest.data_epoch();
         let last = if rotates {
-            current
-                .checked_add(1)
-                .ok_or(SignerError::Records(RecordsFault::Invariant(
-                    "the data epoch can't go higher",
-                )))?
+            Counter::Epoch.next(current, None, 1)?
         } else {
             current
         };
@@ -277,7 +286,7 @@ impl Signer {
             state.claims.retain(|held| held.request != claim.request);
             state.claims.push(claim);
         }
-        state.epoch_through = state.epoch_through.max(last);
+        state.epoch_through = highest_spent_epoch.max(last);
         match by {
             RenewedBy::Automatic { .. } => state.untaken_renewals.push((app_id, new.hash())),
             RenewedBy::User => {
@@ -292,20 +301,6 @@ impl Signer {
         Ok(doc)
     }
 
-    /// Complete the epoch `epoch_through`, above the newest version's `data_epoch`: give every
-    /// current app holding each keyed scope its keys through it, the app of a given-up
-    /// reduction included, as it still holds its scopes, then deliver a version raising
-    /// `data_epoch` to it (Switch spec 3.2, 3.5; Switch wire 3.8). `statuses` is the switch's
-    /// view, read once its copy was confirmed, and `switch_time` the time it is signed at.
-    pub(super) async fn complete_epoch(
-        &mut self,
-        statuses: &[AppStatus],
-        switch_time: u64,
-    ) -> Result<()> {
-        self.rotate_through(statuses, switch_time, self.state.epoch_through)
-            .await
-    }
-
     /// Bring every current app the newest version lists through epoch `through`, and deliver
     /// the version that raises `data_epoch` to it (Switch spec 3.5): an epoch's completion,
     /// or one more rotation after a removal at an epoch the removed apps may hold the keys of
@@ -318,11 +313,13 @@ impl Signer {
     ) -> Result<()> {
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let key = self.signing_key()?;
+        self.state.next_version(newest.version())?;
         let (ops, alerts) = self.catch_up(&key, &newest, statuses, switch_time, &[], through)?;
         let batches = self.sign_batches(&key, newest.generation(), ops)?;
         let (doc, flow) = self.next_version_closing(&key, |body| body.data_epoch = through)?;
         drop(key);
-        let state = self.state.clone();
+        let mut state = self.state.clone();
+        state.epoch_through = through;
         self.commit_batches(state, &newest, statuses, alerts, batches, &doc, flow)
             .await?;
         self.resume().await
@@ -437,7 +434,7 @@ impl Signer {
                 "a version without its delivery",
             )));
         };
-        state.signed_through = state.signed_through.max(doc.version());
+        state.signed_through = doc.version();
         for alert in alerts {
             state.alert(alert);
         }
@@ -487,10 +484,27 @@ impl Signer {
         prev: Option<[u8; 32]>,
     ) -> Result<()> {
         let client = self.account_client(&account)?;
+        let document = crate::state::stored_identity(&doc, &self.state.identity)?;
         for (index, batch) in batches.iter().enumerate().skip(sent) {
             // Before each batch, not once: another install may take over between two.
             self.ensure_signer().await?;
             let signed = batch.read(&self.state.identity)?;
+            for op in signed.ops() {
+                if op.body().generation != document.generation() {
+                    return Err(Refusal::CounterCopyNeeded {
+                        counter: Counter::Generation,
+                    }
+                    .into());
+                }
+                if let OpKind::KeyBundlePut(put) = &op.body().kind
+                    && put.last_epoch > document.data_epoch()
+                {
+                    return Err(Refusal::CounterCopyNeeded {
+                        counter: Counter::Epoch,
+                    }
+                    .into());
+                }
+            }
             match client.submit(&signed).await {
                 Ok(_) => {
                     // Each stored part replaces those whose range it overlaps (Switch wire

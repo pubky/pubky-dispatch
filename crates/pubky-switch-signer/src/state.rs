@@ -254,6 +254,10 @@ pub(crate) struct SignerState {
     /// Every new version is signed above it, so no version is signed twice with two bodies
     /// (Switch spec 4.3, 13.2).
     pub(crate) signed_through: u64,
+    /// The last undelivered version, kept when its flow ends. Its signature still proves
+    /// the slot was spent if the service keeps an older head (Switch spec 4.3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) spent_doc: Option<SignedDoc>,
     /// Every App ID revoked or seen departing, kept for good (Switch spec 12.2).
     pub(crate) tombstones: Vec<[u8; 16]>,
     /// The certificates the newest document references, as signed.
@@ -351,6 +355,8 @@ pub(crate) struct SignerState {
     /// install signed when it was first declared, a version in flight to the lost service
     /// included, since that service may have taken it and apps seen it. Kept while the
     /// recovery is declared again elsewhere, and dropped once its version is delivered.
+    /// For conflicting generations the slot can hold the separate highest-version
+    /// witness. [`SignerState::recovery_doc`] selects the confirmed content in that case.
     pub(crate) recovery_base: Option<SignedDoc>,
     /// The generation a declared recovery declares lost (Switch spec 12.6 step 1): its
     /// version is the next one, with `recovery_from` this. Kept while the recovery is
@@ -584,6 +590,7 @@ impl SignerState {
             service: None,
             newest: None,
             signed_through: 0,
+            spent_doc: None,
             tombstones: Vec::new(),
             certs: Vec::new(),
             bundle_parts: Vec::new(),
@@ -642,6 +649,51 @@ impl SignerState {
             .transpose()
     }
 
+    /// Preserve a spent slot when its signed flow ends without advancing the mark
+    /// (Switch spec 4.3). Keep at most one such document.
+    pub(crate) fn keep_spent(&mut self, signed: &SignedDoc) -> Result<()> {
+        if self.newest.as_ref().is_none_or(|mark| mark.doc != *signed) {
+            let doc = stored_identity(signed, &self.identity)?;
+            let head = self.newest_doc()?.map_or(0, |mark| mark.version());
+            if doc.version() > self.verified_version(head)? {
+                self.spent_doc = Some(signed.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// A refused delivery and a lower-generation recovery witness can each prove a
+    /// higher spent version than the content being updated (Switch spec 4.3, 12.8).
+    pub(crate) fn verified_version(&self, head: u64) -> Result<u64> {
+        let mut version = head;
+        for signed in self.spent_doc.iter().chain(&self.recovery_base) {
+            version = version.max(stored_identity(signed, &self.identity)?.version());
+        }
+        Ok(version)
+    }
+
+    /// The next version above every verified spend and plausible local floor (Switch spec 4.3).
+    pub(crate) fn next_version(&self, head: u64) -> Result<u64> {
+        crate::Counter::Version.next(self.verified_version(head)?, Some(self.signed_through), 1)
+    }
+
+    /// The content chosen for recovery. Across conflicting generations, the key-only
+    /// survey keeps the highest-version witness in the recovery slot and the chosen
+    /// higher generation in the mark (Switch spec 12.8).
+    pub(crate) fn recovery_doc(&self, newest: Option<IdentityDoc>) -> Result<Option<IdentityDoc>> {
+        let Some(signed) = &self.recovery_base else {
+            return Ok(None);
+        };
+        let witness = stored_identity(signed, &self.identity)?;
+        if let Some(mark) = newest
+            && mark.generation() > witness.generation()
+            && mark.version() < witness.version()
+        {
+            return Ok(Some(mark));
+        }
+        Ok(Some(witness))
+    }
+
     pub(crate) fn certificates(&self) -> Result<Vec<AppCert>> {
         self.certs
             .iter()
@@ -682,8 +734,8 @@ impl SignerState {
             }
         }
         self.certificates()?;
-        if let Some(base) = &self.recovery_base {
-            stored_identity(base, &self.identity)?;
+        for signed in self.recovery_base.iter().chain(&self.spent_doc) {
+            stored_identity(signed, &self.identity)?;
         }
         if let Some(handing) = &self.handing_over {
             handing
@@ -794,8 +846,9 @@ impl RecoveryEnrollment {
     /// (Switch spec 12.6 step 1), every one where a recovery with the key alone found no
     /// copy to build on (spec 12.8). Later revocations of listed apps remain deferred work.
     pub(crate) fn check_exclusions(&self, state: &SignerState, origin: &str) -> Result<()> {
-        let base = match &state.recovery_base {
-            Some(base) => Some(stored_identity(base, &state.identity)?),
+        // A damaged newest copy must not hide an exclusion mismatch with the verified base.
+        let base = match state.recovery_doc(state.newest_doc().ok().flatten())? {
+            Some(base) => Some(base),
             None if state.newest.is_none() => None,
             None => {
                 return Err(RecordsFault::Invariant("a recovery enrollment has no base").into());
@@ -948,6 +1001,15 @@ pub(crate) enum Flow {
 }
 
 impl Flow {
+    /// The identity document whose version this flow has spent (Switch spec 4.3).
+    pub(crate) fn signed_version(&self) -> Option<&SignedDoc> {
+        match self {
+            Self::Renew { doc, .. } | Self::Deliver { doc, .. } => Some(doc),
+            Self::TakingOver { delivery, .. } => delivery.as_ref().map(|d| &d.doc),
+            _ => None,
+        }
+    }
+
     /// Check the complete original creation against an independently selected origin.
     pub(crate) fn first_creation_at(
         &self,

@@ -544,12 +544,16 @@ async fn test_store_ownership_close_waits_for_a_canceled_write_then_releases() {
 async fn test_store_ownership_close_reports_an_unknown_write_and_releases() {
     let world = World::new();
     let (signer, store, release) = signer_with_a_waiting_write(&world, true).await;
-    let closing = tokio::spawn(signer.close());
+    let mut closing = Box::pin(signer.close());
+    poll_pending(closing.as_mut());
+    assert!(matches!(
+        StoreHandle::inline(store.clone())
+            .acquire(&signer_namespace(&world.key.public()))
+            .await,
+        Err(StoreError::InUse)
+    ));
     release.send(()).unwrap();
-    assert_eq!(
-        closing.await.unwrap(),
-        Err(SignerError::Store(StoreError::Unknown))
-    );
+    assert_eq!(closing.await, Err(SignerError::Store(StoreError::Unknown)));
     Signer::open(world.env(store.clone()), world.keyring())
         .await
         .unwrap();
